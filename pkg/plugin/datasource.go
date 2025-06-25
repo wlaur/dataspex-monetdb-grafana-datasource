@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"regexp"
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
+	"github.com/grafana/grafana-plugin-sdk-go/data"
 	"github.com/grafana/grafana-plugin-sdk-go/data/sqlutil"
 
 	"database/sql"
+
 	_ "github.com/MonetDB/MonetDB-Go/v2"
 )
 
@@ -50,9 +54,9 @@ func NewDatasource(_ context.Context, settings backend.DataSourceInstanceSetting
 
 // Datasource is an example datasource which can respond to data queries, reports
 // its health and has streaming skills.
-type Datasource struct{
-	dsn string;
-	mDB *sql.DB;
+type Datasource struct {
+	dsn string
+	mDB *sql.DB
 }
 
 // Dispose here tells plugin SDK that plugin wants to clean up resources when a new instance
@@ -64,10 +68,10 @@ func (d *Datasource) Dispose() {
 }
 
 type dataModel struct {
-	Username string `json:"username"`;
-	Hostname string `json:"hostname"`;
-	Port int `json:"port"`;
-	Database string `json:"database"`;
+	Username string `json:"username"`
+	Hostname string `json:"hostname"`
+	Port     int    `json:"port"`
+	Database string `json:"database"`
 }
 
 func Dsn(req *backend.DataSourceInstanceSettings) string {
@@ -86,13 +90,21 @@ func Dsn(req *backend.DataSourceInstanceSettings) string {
 	var database = "monetdb"
 	var password_dec string
 
-	if jsonData.Username != "" { username = jsonData.Username }
-	if jsonData.Hostname != "" { hostname = jsonData.Hostname }
-	if jsonData.Port != 0 {port = jsonData.Port}
-	if jsonData.Database != "" { database = jsonData.Database }
+	if jsonData.Username != "" {
+		username = jsonData.Username
+	}
+	if jsonData.Hostname != "" {
+		hostname = jsonData.Hostname
+	}
+	if jsonData.Port != 0 {
+		port = jsonData.Port
+	}
+	if jsonData.Database != "" {
+		database = jsonData.Database
+	}
 
 	if password, exists := req.DecryptedSecureJSONData["password"]; exists {
-	  password_dec = password
+		password_dec = password
 	} else {
 		password_dec = "monetdb"
 	}
@@ -118,7 +130,30 @@ func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataReques
 	return response, nil
 }
 
-type queryModel struct{ Querytext string `json:"queryText"` }
+type queryModel struct {
+	Querytext string `json:"queryText"`
+}
+
+var MonetDBRealToNullableFloat64Converter = sqlutil.Converter{
+	Name:           "monetdb-real-to-float64",
+	InputScanType:  reflect.TypeOf(new(sql.NullFloat64)),
+	InputTypeRegex: regexp.MustCompile(`(?i)^REAL$`),
+	FrameConverter: sqlutil.FrameConverter{
+		FieldType: data.FieldTypeNullableFloat64,
+		ConverterFunc: func(in any) (any, error) {
+			ptr, ok := in.(*sql.NullFloat64)
+			if !ok {
+				return nil, fmt.Errorf("unexpected input type: %T", in)
+			}
+
+			if ptr.Valid {
+				f := ptr.Float64
+				return &f, nil
+			}
+			return nil, nil
+		},
+	},
+}
 
 func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
 	log.DefaultLogger.Debug("monetdb: execute the query")
@@ -130,7 +165,7 @@ func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query 
 	if err != nil {
 		return backend.ErrDataResponse(backend.StatusBadRequest, fmt.Sprintf("monetdb: json unmarshal: %s", err.Error()))
 	}
-// 		if len(strings.TrimSpace(string(q.JSON))) > 0 {}
+	// 		if len(strings.TrimSpace(string(q.JSON))) > 0 {}
 
 	rows, err := d.mDB.Query(qm.Querytext)
 	if err != nil {
@@ -142,7 +177,9 @@ func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query 
 	}
 	defer rows.Close()
 
-	frame, err := sqlutil.FrameFromRows(rows, -1)
+	// convert real (float32) to float64 to handle nulls (there is no nullable float32 type in database/sql)
+	frame, err := sqlutil.FrameFromRows(rows, -1, MonetDBRealToNullableFloat64Converter)
+
 	if err != nil {
 		log.DefaultLogger.Error("monetdb: could not convert resultset to frame: %s", err.Error())
 		response.Error = err
